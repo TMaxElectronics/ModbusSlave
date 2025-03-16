@@ -68,7 +68,7 @@ typedef struct{
 
 //--------------------------- init and layer 1 setup functions ----------------------------------------------------------------------------------------------------- 
 
-ModbusHandle_t * MBS_create(UartHandle_t * uartHandle, TimerHandle_t * timerHandle, ModbusConfig_t * config, uint32_t address);
+ModbusHandle_t * MBS_create(UartHandle_t * uartHandle, TimerHandle_t * timerHandle, ModbusConfig_t * config);
 
 uint32_t MBS_destroy(ModbusHandle_t * handle);
 

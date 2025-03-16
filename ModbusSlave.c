@@ -2,6 +2,7 @@
 #include <stdint.h>
 
 #include "ModbusSlave.h"
+#include "TimerConfig.h"
 
 //TODO move these to the modbusconfig.h file -------------------------------------------------
 
@@ -13,7 +14,7 @@
 #define MBS_MAX_PACKET_SIZE 256
 //-------------------------------------------------
 
-#define MBS_GET_DATA_PTR(handle, rawDataPtr) (uint8_t *) (&rawDataPtr[handle->use16BitAddress ? 2 : 1])
+#define MBS_GET_DATA_PTR(handle, rawDataPtr) (uint8_t *) (&rawDataPtr[handle->use16BitAddress ? 3 : 2])
 #define MBS_GET_PACKET_SIZE(handle, dataSize) (dataSize + (handle->use16BitAddress ? 5 : 4))
 
 //zero variable to be copied into the timer counters
@@ -31,7 +32,7 @@ static uint32_t MBS_timerISR(TimerHandle_t * timer, uint32_t flags, void* data);
 static uint32_t MBS_uartISR(UartHandle_t * uart, uint32_t flags, void* data);
 
 
-ModbusHandle_t * MBS_create(UartHandle_t * uartHandle, TimerHandle_t * timerHandle, ModbusConfig_t * config, uint32_t address){
+ModbusHandle_t * MBS_create(UartHandle_t * uartHandle, TimerHandle_t * timerHandle, ModbusConfig_t * config){
     //is the config valid?
     if(config->uartBaudrate < 4800) return NULL;
     
@@ -110,6 +111,7 @@ ModbusHandle_t * MBS_create(UartHandle_t * uartHandle, TimerHandle_t * timerHand
     
     //create a semaphore
     ret->semaphore = xSemaphoreCreateBinary();
+    xSemaphoreGive(ret->semaphore);
     
     //generate the event stream
     ret->eventQueue = xQueueCreate(MODBUS_EVENTBUFFER_SIZE, sizeof(ModbusEventDescriptor_t));
@@ -139,9 +141,6 @@ ModbusHandle_t * MBS_create(UartHandle_t * uartHandle, TimerHandle_t * timerHand
     DMA_setIRQHandler(ret->auxDmaHandle, MBS_dmaISR, ret);
     
     //setup the uart module
-    
-    //setup rts pin for simplex flow control mode
-    UART_setFlowControl(ret->uartHandle, UART_RTSMODE_SIMPLEX, UART_FC_RTS);
     
     //no signal inversion
     UART_setOutputInvert(ret->uartHandle, 0, 0);
@@ -204,13 +203,15 @@ uint32_t MBS_destroy(ModbusHandle_t * handle){
     return pdPASS;
 }
 
+
+
 //--------------------------- config functions ----------------------------------------------------------------------------------------------------- 
 
 static void MBS_updateCharacterTimes(ModbusHandle_t * handle, ModbusConfig_t * config){
     if(config->uartBaudrate < 4800) return;
     
-    //get t1
-    uint32_t charTime_ns = 11 * (1000000000 / config->uartBaudrate);
+    //get t1. Calculate it if it isn't spe'c
+    uint32_t charTime_ns = (config->characterTime_us == 0) ? (11 * (1000000000 / config->uartBaudrate)) : (config->characterTime_us * 1000);
     
     //derive t1.5,t2 and t3.5
     uint32_t t1_5_us    = (charTime_ns * 15)    / 10000;
@@ -221,6 +222,9 @@ static void MBS_updateCharacterTimes(ModbusHandle_t * handle, ModbusConfig_t * c
     handle->t1_5prValue = TMR_calculatePR(handle->timerHandle, t1_5_us, 1);
     handle->t2prValue = TMR_calculatePR(handle->timerHandle, t2_us, 1);
     handle->t3_5prValue = TMR_calculatePR(handle->timerHandle, t3_5_us, 1);
+    
+    //also set the timer prescaler
+    TMR_setPrescaler(handle->timerHandle, 1);
 }
 
 void MBS_handleConfigUpdate(ModbusHandle_t * handle, ModbusConfig_t * config){
@@ -395,6 +399,10 @@ static uint32_t MBS_transmitFrame(ModbusHandle_t * handle, uint8_t * buffer, uin
     //first disable all uart interrupts and rx in general to prevent a new frame reception from being triggered while we prepare for sending one
     //the error interrupts are not needed as an error would only be expected to be detected if monitorTransmission is 1. But if thats the case though we do a memcompare after we're done which would detect an error anyway
     UART_setIRQsEnabled(handle->uartHandle, 0);
+    
+    UART_setTxIrqMode(handle->uartHandle, UART_TX_IRQ_WHEN_SPACE_AVAILABLE);
+    UART_setRxIrqMode(handle->uartHandle, UART_RX_IRQ_WHEN_DATA_AVAILABLE);
+    
     UART_setRxEnabled(handle->uartHandle, 0);
     UART_setTxEnabled(handle->uartHandle, 1);
     
@@ -424,6 +432,8 @@ static uint32_t MBS_transmitFrame(ModbusHandle_t * handle, uint8_t * buffer, uin
     DMA_setSrcConfig(handle->dataDmaHandle, UART_getRXRegPtr(handle->uartHandle), sizeof(uint8_t));
     
     //enable block done interrupt for the aux channel (module internal enable bits are already set in our init function)
+    DMA_clearIF(handle->auxDmaHandle, DMA_ALL_IF);
+    DMA_clearGloablIF(handle->auxDmaHandle);
     DMA_setIRQEnabled(handle->auxDmaHandle, 1);
     
     //and reenable the rx channel and dma if we want to listen back to what we send out
@@ -434,14 +444,17 @@ static uint32_t MBS_transmitFrame(ModbusHandle_t * handle, uint8_t * buffer, uin
     //NOTE: if some other device on the bus started transmitting a packet while we were preparing to do so it will overwrite the data in the buffer
     //      this is however not a problem, as this has the desired effect of resulting in non-matching buffer content
     
-    //at this point the hardware is set up for transmission, start it
+    //do tx callback
+    UART_txCallback(handle->uartHandle, UART_TX_STARTED);
     
+    //at this point the hardware is set up for transmission, start it
     DMA_setEnabled(handle->auxDmaHandle, 1);
     DMA_forceTransfer(handle->auxDmaHandle);
     
     //now the transmission is running and we need to wait until it finished and t3.5 elapsed. This is signaled to us by returning the semaphore => try to take it again
     if(!xSemaphoreTake(handle->semaphore, MODBUS_TX_TIMEOUT)){
         //didn't get it, tx failed. We need to clean up and return to rx mode
+        UART_txCallback(handle->uartHandle, UART_TX_FINISHED);
         
         //abort dma
         DMA_abortTransfer(handle->dataDmaHandle);
@@ -450,8 +463,16 @@ static uint32_t MBS_transmitFrame(ModbusHandle_t * handle, uint8_t * buffer, uin
         //disable uart tx again
         UART_setTxEnabled(handle->uartHandle, 0);
         
+        //since something went wrong we'll also manually return the semaphore if rx is inactive
+        xSemaphoreGive(handle->semaphore);
+        
         //setup reception again if needed
-        if(handle->rxEnabled) MBS_startRx(handle);
+        if(handle->rxEnabled){ 
+            MBS_startRx(handle); 
+        }else{
+            //no rx will not be enabled again, return the semaphore manually TODO delay
+            xSemaphoreGive(handle->semaphore);
+        }
         return pdFAIL;
     }
     
@@ -463,14 +484,18 @@ static uint32_t MBS_transmitFrame(ModbusHandle_t * handle, uint8_t * buffer, uin
 
     //the transmission went out successfully, set up for reception again if it was enabled. This also enters state 3 which causes a delay of t3.5 until we get to do anything again
     //if it wasn't enabled we just wait at least the t3.5 with vTaskDelay() TODO!
-    if(handle->rxEnabled) MBS_startRx(handle); else;
-    
+    if(handle->rxEnabled){ 
+        MBS_startRx(handle); 
+    }else{
+        //no rx will not be enabled again, return the semaphore manually TODO delay
+        xSemaphoreGive(handle->semaphore);
+    }
     
     //do we want to check that what was supposed to go out onto the bus actually did so?
     if(monitorTransmission){
         //TODO / NOTE: this does not evaluate presence of the t3.5 delay after the frame was transmitted!
-        //yes! do a memcompare
-        if(memcmp(buffer, handle->buffers[handle->lastBuffer], size * sizeof(uint8_t)) == 0){
+        //yes! do a memcompare. if rx is not enabled then getNextbuffer wouldn't have been called since the start of the tx, so the buffer the data was written into is currentbuffer instead of lastbuffer
+        if(memcmp(buffer, handle->buffers[(handle->rxEnabled) ? handle->lastBuffer : handle->currentBuffer], size * sizeof(uint8_t)) == 0){
             //contents match => transmission successful
             return pdPASS;
         }else{
@@ -538,6 +563,16 @@ static uint32_t MBS_uartISR(UartHandle_t * uart, uint32_t flags, void* data){
             //at this point everything is setup for state 1 (reception of the data)
         }
     }
+    
+    if(flags & UART_EVENTFLAG_TX_IRQ){
+        //tx irq is only on when we are transmitting and waiting for that to finish. Return the semaphore and clear the txEn
+        UART_txCallback(handle->uartHandle, UART_TX_FINISHED);
+        
+        //disable uart tx interrupt again (its the only one thats enabled at this point)
+        UART_setIRQsEnabled(handle->uartHandle, 0);
+        
+        xSemaphoreGiveFromISR(handle->semaphore, NULL);
+    }
 }
 
 static uint32_t MBS_timerISR(TimerHandle_t * timer, uint32_t flags, void* data){
@@ -577,6 +612,7 @@ static uint32_t MBS_timerISR(TimerHandle_t * timer, uint32_t flags, void* data){
         }
         
         //enable uart rx irq (required regardless of state 0 or state 2)
+        UART_clearRxIF(handle->uartHandle);
         UART_setIRQsEnabled(handle->uartHandle, UART_EVENTFLAG_RX_IRQ | UART_EVENTFLAG_ERROR_PARITY | UART_EVENTFLAG_ERROR_FRAMING);
         
     }else if(*TMR_getPRPointer(timer) == handle->t3_5prValue){
@@ -624,25 +660,27 @@ static uint32_t MBS_dmaISR(uint32_t evt, void * data){
     //get our handle
     ModbusHandle_t * handle = (ModbusHandle_t *) data;
     
-    //this interrupt is only enabled when we are transmitting, and triggers once the last byte was written into the uart. Just return the semaphore, everything else is handled in the transmit function
-    xSemaphoreGiveFromISR(handle->semaphore, NULL);
+    //we now need to wait for the transmission to finish, so set that up
+    UART_setTxIrqMode(handle->uartHandle, UART_TX_IRQ_WHEN_FINAL_BYTE_SENT);
+    UART_clearTxIF(handle->uartHandle);
+    UART_setIRQsEnabled(handle->uartHandle, UART_EVENTFLAG_TX_IRQ);
 }
 
 
 //--------------------------- layer 3 functions ----------------------------------------------------------------------------------------------------- 
 
-static uint32_t MBS_calculateCrc(uint8_t * data, uint32_t length){
+static uint16_t MBS_calculateCrc(uint8_t * data, uint32_t length){
     //TODO move this to the dma's crc module?
     
     //honestly crcs are black voodo magic, so i just used the implementation i also use in ConMan :3 Its actually even using the same polynomial
-    uint32_t crc = 0xffff;
-    
-    for(uint32_t cb = 0; cb < length; cb++){
-        crc ^= data[cb];
-        for (uint32_t i = 0; i < 8; i++) {
-            if (crc & 1){
+    uint16_t crc = 0xFFFF;  // Initialize CRC-16
+
+    for (uint32_t cb = 0; cb < length; cb++) {
+        crc ^= (uint16_t)data[cb];  // XOR with byte
+        for (uint8_t i = 0; i < 8; i++) {
+            if (crc & 1) {
                 crc = (crc >> 1) ^ MODBUS_CRC_POLYNOMIAL;
-            }else{
+            } else {
                 crc >>= 1;
             }
         }
@@ -683,8 +721,8 @@ static uint32_t MBS_generateFrame(ModbusHandle_t * handle, ModbusFrameDescriptor
     
     //crc is the last two bytes
     frameDescriptor->crc = MBS_calculateCrc(buffer, finalFrameSize - 2);
-    data[finalFrameSize-2] = frameDescriptor->crc;
-    data[finalFrameSize-1] = frameDescriptor->crc >> 8;
+    buffer[finalFrameSize-2] = frameDescriptor->crc;
+    buffer[finalFrameSize-1] = frameDescriptor->crc >> 8;
     
     return pdPASS;
 }
