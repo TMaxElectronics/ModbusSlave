@@ -4,16 +4,6 @@
 #include "ModbusSlave.h"
 #include "TimerConfig.h"
 
-//TODO move these to the modbusconfig.h file -------------------------------------------------
-
-#define MODBUS_EVENTBUFFER_SIZE 8
-#define MODBUS_BUFFER_SIZE 256
-#define MODBUS_BUFFERCOUNT 4
-
-#define MODBUS_CRC_POLYNOMIAL 0xA001
-#define MBS_MAX_PACKET_SIZE 256
-//-------------------------------------------------
-
 #define MBS_GET_DATA_PTR(handle, rawDataPtr) (uint8_t *) (&rawDataPtr[handle->use16BitAddress ? 3 : 2])
 #define MBS_GET_PACKET_SIZE(handle, dataSize) (dataSize + (handle->use16BitAddress ? 5 : 4))
 
@@ -524,7 +514,7 @@ static uint32_t MBS_uartISR(UartHandle_t * uart, uint32_t flags, void* data){
         //disable the uart rx interrupt
         UART_setIRQsEnabled(handle->uartHandle, UART_EVENTFLAG_ERROR_PARITY | UART_EVENTFLAG_ERROR_FRAMING);
         
-        //send event
+        //send event TODO perhaps also send what the error was?
         MBS_sendEventFromISR(handle, MBS_EVT_UART_ERROR, NULL, 0);
     }
     
