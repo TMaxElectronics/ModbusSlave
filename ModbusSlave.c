@@ -300,7 +300,7 @@ void MBS_startRx(ModbusHandle_t * handle){
      */
 
 //setup uart module
-    UART_setIRQsEnabled(handle->uartHandle, UART_EVENTFLAG_ERROR_PARITY | UART_EVENTFLAG_ERROR_FRAMING | UART_EVENTFLAG_ERROR_IRQ);
+    UART_setIRQsEnabled(handle->uartHandle, UART_EVENTFLAG_ERROR_PARITY | UART_EVENTFLAG_ERROR_FRAMING);
     UART_setRxEnabled(handle->uartHandle, 1);
 
 //enable timer interrupt and prepare it for state 0
@@ -502,7 +502,7 @@ static uint32_t MBS_uartISR(UartHandle_t * uart, uint32_t flags, void* data){
     ModbusHandle_t * handle = (ModbusHandle_t *) data;
     
     //uart interrupt was just triggered, check what happened
-    if(flags & (UART_EVENTFLAG_ERROR_IRQ)){
+    if(flags & (UART_EVENTFLAG_ERROR_FRAMING | UART_EVENTFLAG_ERROR_PARITY)){
         //some receiver error just occured. This can happen at any time during a reception. Check where we are and deal with it accordingly
         
         //no matter where we are we will always have to reset to state 3 and discard the current frame
@@ -512,7 +512,7 @@ static uint32_t MBS_uartISR(UartHandle_t * uart, uint32_t flags, void* data){
         TMR_setPR(handle->timerHandle, handle->t3_5prValue);
         
         //disable the uart rx interrupt
-        UART_setIRQsEnabled(handle->uartHandle, UART_EVENTFLAG_ERROR_PARITY | UART_EVENTFLAG_ERROR_FRAMING | UART_EVENTFLAG_ERROR_IRQ);
+        UART_setIRQsEnabled(handle->uartHandle, UART_EVENTFLAG_ERROR_PARITY | UART_EVENTFLAG_ERROR_FRAMING);
         
         //send event TODO perhaps also send what the error was?
         MBS_sendEventFromISR(handle, MBS_EVT_UART_ERROR, NULL, 0);
@@ -520,7 +520,7 @@ static uint32_t MBS_uartISR(UartHandle_t * uart, uint32_t flags, void* data){
     
     if(flags & UART_EVENTFLAG_RX_IRQ){
         //a byte was received! Make sure to disable the interrupt right away so we don't get called again when the next byte is received
-        UART_setIRQsEnabled(uart, UART_EVENTFLAG_ERROR_PARITY | UART_EVENTFLAG_ERROR_FRAMING | UART_EVENTFLAG_ERROR_IRQ);
+        UART_setIRQsEnabled(uart, UART_EVENTFLAG_ERROR_PARITY | UART_EVENTFLAG_ERROR_FRAMING);
         
         //check if we are in state 0 or state 2 (state 2 would have the timer enabled)
         if(TMR_isEnabled(handle->timerHandle)){
@@ -603,7 +603,7 @@ static uint32_t MBS_timerISR(TimerHandle_t * timer, uint32_t flags, void* data){
         
         //enable uart rx irq (required regardless of state 0 or state 2)
         UART_clearRxIF(handle->uartHandle);
-        UART_setIRQsEnabled(handle->uartHandle, UART_EVENTFLAG_RX_IRQ | UART_EVENTFLAG_ERROR_PARITY | UART_EVENTFLAG_ERROR_FRAMING | UART_EVENTFLAG_ERROR_IRQ);
+        UART_setIRQsEnabled(handle->uartHandle, UART_EVENTFLAG_RX_IRQ | UART_EVENTFLAG_ERROR_PARITY | UART_EVENTFLAG_ERROR_FRAMING);
         
     }else if(*TMR_getPRPointer(timer) == handle->t3_5prValue){
         //we are in state 3 (waiting for final timeout after a frame with an error) and the timeout has occured => reset to state 0
@@ -619,7 +619,7 @@ static uint32_t MBS_timerISR(TimerHandle_t * timer, uint32_t flags, void* data){
         xSemaphoreGiveFromISR(handle->semaphore, NULL);
         
         //disable the uart rx interrupt
-        UART_setIRQsEnabled(handle->uartHandle, UART_EVENTFLAG_RX_IRQ | UART_EVENTFLAG_ERROR_PARITY | UART_EVENTFLAG_ERROR_FRAMING | UART_EVENTFLAG_ERROR_IRQ);
+        UART_setIRQsEnabled(handle->uartHandle, UART_EVENTFLAG_RX_IRQ | UART_EVENTFLAG_ERROR_PARITY | UART_EVENTFLAG_ERROR_FRAMING);
     }else{
         //we're in state 2 
         //  the t3.5 after the last frame has elapsed, frame was valid
